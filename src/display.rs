@@ -1,4 +1,4 @@
-use alloc::{boxed::Box, vec, vec::Vec};
+use alloc::{boxed::Box, vec};
 
 use esp_hal::{delay::Delay, peripherals};
 use log::*;
@@ -124,7 +124,7 @@ impl<'a> Display<'a> {
     /// [Error::OutOfBounds]. If the provided color is greater than 0x0F,
     /// this method returns [Error::InvalidColor].
     pub fn set_pixel(&mut self, x: u16, y: u16, color: u8) -> Result<()> {
-        if x > Self::WIDTH || y > Self::HEIGHT {
+        if x >= Self::WIDTH || y >= Self::HEIGHT {
             return Err(Error::OutOfBounds);
         }
         if color > 0x0F {
@@ -139,8 +139,9 @@ impl<'a> Display<'a> {
             self.framebuffer[index] = (value & 0xF0) | (color & 0x0F);
         }
         // taint row
-        let tainted_index = y as usize / TAINTED_ROWS_SIZE;
-        self.tainted_rows[tainted_index] |= 1 << ((y - (tainted_index as u16 * 8)) % 8);
+        let tainted_index = y as usize / 8;
+        let bit = (y & 0x7) as u8;
+        self.tainted_rows[tainted_index] |= 1u8 << bit;
         Ok(())
     }
 
@@ -217,6 +218,7 @@ impl<'a> Display<'a> {
             row[(area.x / 4 + pos / 4) as usize] |= mask;
         }
         line_buffer_reorder(&mut row);
+        self.skipping = 0;
         self.epd.frame_start()?;
 
         for i in 0..Self::HEIGHT {
@@ -236,7 +238,6 @@ impl<'a> Display<'a> {
             }
             self.row_write(time)?;
         }
-        self.row_write(time)?;
         self.epd.frame_end()?;
 
         Ok(())
@@ -268,8 +269,9 @@ impl<'a> Display<'a> {
     }
 
     fn is_tainted(&self, row: u16) -> bool {
-        let index = row as usize / TAINTED_ROWS_SIZE;
-        self.tainted_rows[index] & (1 << ((row - (index as u16 * 8)) % 8)) != 0
+        let index = row as usize / 8;
+        let bit = (row & 0x7) as u8;
+        self.tainted_rows[index] & (1u8 << bit) != 0
     }
 
     const DRAW_IMAGE_FRAME_COUNT: usize = 15;
@@ -283,6 +285,7 @@ impl<'a> Display<'a> {
             // update lut
             update_lut(&mut lut, k, mode);
             // start draw
+            self.skipping = 0;
             self.epd.frame_start()?;
             // build line
             for y in 0..Self::HEIGHT {
@@ -293,12 +296,10 @@ impl<'a> Display<'a> {
                 let start = y as usize * LINE_BYTES_4BPP;
                 let end = start + LINE_BYTES_4BPP;
                 // draw
-                let buf = prepare_dma_buffer(&self.framebuffer[start..end], &lut);
-                self.epd.set_buffer(buf.as_slice())?;
+                let mut dma_line = [0u8; BYTES_PER_LINE];
+                prepare_dma_buffer(&self.framebuffer[start..end], &lut, &mut dma_line);
+                self.epd.set_buffer(&dma_line)?;
                 self.epd.output_row(mode.contrast_cycles()[k])?;
-            }
-            if self.skipping == 0 {
-                self.row_write(mode.contrast_cycles()[k])?;
             }
             self.epd.frame_end()?;
         }
@@ -321,30 +322,24 @@ fn line_buffer_reorder(data: &mut [u8]) {
     }
 }
 
-fn prepare_dma_buffer(line_data: &[u8], conversion_lut: &[u8]) -> Vec<u8> {
-    let mut epd_input = vec![0u8; BYTES_PER_LINE];
-    let mut wide_epd_input: Vec<u32> = vec![0u32; Display::WIDTH as usize / 16];
+fn prepare_dma_buffer(line_data: &[u8], conversion_lut: &[u8], out: &mut [u8; BYTES_PER_LINE]) {
+    // The input is 4bpp (2 pixels per byte), which we process in 8-byte chunks:
+    // 8 bytes => 4 u16s => 16 pixels.
+    //
+    // The output is 2bpp packed (16 pixels => 32 bits => 4 bytes).
+    for (j, chunk) in line_data.chunks_exact(8).enumerate() {
+        let v1 = u16::from_le_bytes([chunk[0], chunk[1]]);
+        let v2 = u16::from_le_bytes([chunk[2], chunk[3]]);
+        let v3 = u16::from_le_bytes([chunk[4], chunk[5]]);
+        let v4 = u16::from_le_bytes([chunk[6], chunk[7]]);
 
-    let line_data_16: Vec<u16> = line_data
-        .chunks(2)
-        .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
-        .collect();
+        let pixel: u32 = (conversion_lut[v1 as usize] as u32)
+            | (conversion_lut[v2 as usize] as u32) << 8
+            | (conversion_lut[v3 as usize] as u32) << 16
+            | (conversion_lut[v4 as usize] as u32) << 24;
 
-    for (j, chunk) in line_data_16.chunks(4).enumerate() {
-        if let [v1, v2, v3, v4] = chunk {
-            let pixel: u32 = (conversion_lut[*v1 as usize] as u32)
-                | (conversion_lut[*v2 as usize] as u32) << 8
-                | (conversion_lut[*v3 as usize] as u32) << 16
-                | (conversion_lut[*v4 as usize] as u32) << 24;
-            wide_epd_input[j] = pixel;
-        }
+        out[j * 4..(j + 1) * 4].copy_from_slice(&pixel.to_le_bytes());
     }
-
-    for (i, &wide_pixel) in wide_epd_input.iter().enumerate() {
-        epd_input[i * 4..(i + 1) * 4].copy_from_slice(&wide_pixel.to_le_bytes());
-    }
-
-    epd_input
 }
 
 fn update_lut(conversion_lut: &mut [u8], k: usize, mode: DrawMode) {

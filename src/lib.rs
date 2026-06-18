@@ -84,6 +84,8 @@ mod rmt;
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Error {
     /// Pass-through
+    I8080Config(esp_hal::lcd_cam::lcd::i8080::ConfigError),
+    /// Pass-through
     Rmt(esp_hal::rmt::Error),
     /// Pass-through
     RmtConfig(esp_hal::rmt::ConfigError),
@@ -103,16 +105,18 @@ type Result<T> = core::result::Result<T, Error>;
 pub use crate::{
     battery::Battery,
     display::{Display, DrawMode},
-    ed047tc1::PinConfig,
+    ed047tc1::{LilyGoT5V23Pins, M5PaperS3Pins, PinConfig},
 };
 
-/// Convenience macro to build the pin config struct.
+/// Convenience macro to build the [`PinConfig::LilyGoT5V23`] pin config for the
+/// LilyGo T5 4.7" V2.3 board. The PaperS3 wiring is board-specific; build
+/// [`PinConfig::M5PaperS3`] with [`M5PaperS3Pins`] directly.
 #[macro_export]
 macro_rules! pin_config {
     ($($name:ident),*) => {
         $(
             #[allow(unused_mut)]
-            lilygo_epd47::PinConfig {
+            lilygo_epd47::PinConfig::LilyGoT5V23(lilygo_epd47::LilyGoT5V23Pins {
                 data0: $name.GPIO8,
                 data1: $name.GPIO1,
                 data2: $name.GPIO2,
@@ -127,7 +131,7 @@ macro_rules! pin_config {
                 lcd_dc: $name.GPIO40,
                 lcd_wrx: $name.GPIO41,
                 rmt: $name.GPIO38,
-            }
+            })
         )*
     }
 }
