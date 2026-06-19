@@ -224,7 +224,7 @@ impl<'a> Display<'a> {
         for i in 0..Self::HEIGHT {
             // before are of interest: skip
             if i < area.y {
-                self.row_skip(time)?;
+                self.epd.skip()?;
                 continue;
             }
             if i == area.y {
@@ -233,7 +233,7 @@ impl<'a> Display<'a> {
                 continue;
             }
             if i >= area.y + area.height {
-                self.row_skip(time)?;
+                self.epd.skip()?;
                 continue;
             }
             self.row_write(time)?;
@@ -243,6 +243,11 @@ impl<'a> Display<'a> {
         Ok(())
     }
 
+    // Retained for reference / the LilyGo backend's original skip-with-output behavior. Partial
+    // clear_area now skips out-of-rect rows via the inert epd.skip() (CKV-only) instead, matching
+    // flush()'s draw() path — the old zero-buffer scanline output faintly grayed non-cleared rows
+    // on the M5PaperS3 panel over repeated landscape partial updates.
+    #[allow(dead_code)]
     fn row_skip(&mut self, output_time: u16) -> Result<()> {
         match self.skipping {
             0 => {
