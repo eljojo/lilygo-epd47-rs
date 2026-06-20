@@ -79,6 +79,7 @@ pub mod graphics;
 mod battery;
 mod ed047tc1;
 mod rmt;
+mod waveform;
 
 /// Errors
 #[derive(Debug, Clone, Copy, PartialEq)]

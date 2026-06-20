@@ -3,13 +3,18 @@ use alloc::{boxed::Box, vec};
 use esp_hal::{delay::Delay, peripherals};
 use log::*;
 
-use crate::{ed047tc1, Error, Result};
+use crate::{ed047tc1, waveform, Error, Result};
 
 const CONTRAST_CYCLES_4BPP: &[u16; 15] = &[
     30, 30, 20, 20, 30, 30, 30, 40, 40, 50, 50, 50, 100, 200, 300,
 ];
 const CONTRAST_CYCLES_4BPP_WHITE: &[u16; 15] =
     &[10, 10, 8, 8, 8, 8, 8, 10, 10, 15, 15, 20, 20, 100, 300];
+
+/// Per-phase CKV dwell for the calibrated waveform path. The epdiy waveform uses uniform phase timing
+/// (its `phase_times` is NULL), and at this value the per-line time is DMA-bound (~15.5 µs/line) — so
+/// every phase is driven for the same ~15.5 µs, which is what the calibrated phase counts assume.
+const WF_DWELL: u16 = 30;
 
 /// Display rotation, only 90° increments supported
 #[derive(Clone, Copy, Default)]
@@ -158,6 +163,20 @@ impl<'a> Display<'a> {
         Ok(())
     }
 
+    /// Calibrated grayscale flush: replays the vendored epdiy ED047TC2 GC16 waveform (mode 5) for the
+    /// given temperature bucket (`range_idx` 0 = cold .. 6 = hot), from a WHITE start — the caller must
+    /// `clear()` first, exactly like the normal full-repaint path. Wipes the framebuffer afterward.
+    ///
+    /// Unlike [`flush`] (a hand-tuned bit-plane darken-from-white), this drives the real vendor-calibrated
+    /// per-gray phase sequence: each pixel's target gray indexes the waveform's white-source column, and
+    /// each phase emits darken / lighten / no-op so the NET drive lands the calibrated gray level.
+    pub fn flush_waveform(&mut self, range_idx: usize) -> Result<()> {
+        debug!("display flush_waveform");
+        self.draw_waveform(waveform::mode5_bucket(range_idx))?;
+        self.framebuffer.fill(0xFF);
+        Ok(())
+    }
+
     /// Clears the screen.
     pub fn clear(&mut self) -> Result<()> {
         debug!("display clear");
@@ -292,6 +311,58 @@ impl<'a> Display<'a> {
         // );
         Ok(())
     }
+
+    /// Replay a calibrated epdiy waveform `[phase][16 target-gray][4 bytes]` from a WHITE source. For each
+    /// phase, the per-target-gray op (white-source column) is mapped to the panel's 2-bit codes and
+    /// expanded into the 16-bit→byte conversion LUT, then every one of the 540 rows is driven (reference
+    /// invariant — see `draw`: under static-high OE every clocked row must carry balanced content).
+    fn draw_waveform(&mut self, phases: &[[[u8; 4]; 16]]) -> Result<()> {
+        let mut lut = vec![0u8; 1 << 16];
+        for phase in phases {
+            // White-source op per target gray g (framebuffer white = 0x0F), mapped epdiy -> panel codes:
+            //   1 darken -> 0b01, 2 lighten -> 0b10, 0 no-op -> 0b11 (true inert; 0b00 faintly darkens).
+            let mut op = [0u8; 16];
+            for (g, slot) in op.iter_mut().enumerate() {
+                *slot = match epdiy_op(&phase[g], 0x0F) {
+                    1 => 0b01,
+                    2 => 0b10,
+                    _ => 0b11,
+                };
+            }
+            // Expand the 16-entry op table to the 4-pixel (16-bit index -> packed byte) conversion LUT
+            // that prepare_dma_buffer expects.
+            for (idx, cell) in lut.iter_mut().enumerate() {
+                *cell = op[idx & 0xF]
+                    | (op[(idx >> 4) & 0xF] << 2)
+                    | (op[(idx >> 8) & 0xF] << 4)
+                    | (op[(idx >> 12) & 0xF] << 6);
+            }
+            self.epd.frame_start()?;
+            for y in 0..Self::HEIGHT {
+                let start = y as usize * LINE_BYTES_4BPP;
+                let mut dma_line = [0u8; BYTES_PER_LINE];
+                prepare_dma_buffer(
+                    &self.framebuffer[start..start + LINE_BYTES_4BPP],
+                    &lut,
+                    &mut dma_line,
+                );
+                self.epd.set_buffer(&dma_line)?;
+                self.epd.output_row(WF_DWELL)?;
+            }
+            self.epd.frame_end()?;
+        }
+        Ok(())
+    }
+}
+
+/// Decode the epdiy waveform 2-bit op for source gray `from` (0..15) from one `[16 target-gray][4 byte]`
+/// phase row's 4-byte source-gray pack. 16 source grays are packed 2 bits each across the 4 bytes,
+/// MSB-first within a byte (verified by decoding the vendored ED047TC2 table). Returns 0 = no-op,
+/// 1 = darken, 2 = lighten.
+fn epdiy_op(quad: &[u8; 4], from: usize) -> u8 {
+    let byte = quad[from / 4];
+    let shift = (3 - (from % 4)) * 2;
+    (byte >> shift) & 0b11
 }
 
 fn line_buffer_reorder(data: &mut [u8]) {
