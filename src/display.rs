@@ -56,7 +56,6 @@ impl DrawMode {
     }
 }
 
-const TAINTED_ROWS_SIZE: usize = Display::HEIGHT as usize / 8 + 1;
 const FRAMEBUFFER_SIZE: usize = (Display::WIDTH / 2) as usize * Display::HEIGHT as usize;
 const BYTES_PER_LINE: usize = Display::WIDTH as usize / 4;
 const LINE_BYTES_4BPP: usize = Display::WIDTH as usize / 2;
@@ -65,7 +64,6 @@ pub struct Display<'a> {
     epd: ed047tc1::ED047TC1<'a>,
     skipping: u16,
     framebuffer: Box<[u8; FRAMEBUFFER_SIZE]>,
-    tainted_rows: [u8; TAINTED_ROWS_SIZE],
     rotation: DisplayRotation,
 }
 
@@ -91,7 +89,6 @@ impl<'a> Display<'a> {
             epd: ed047tc1::ED047TC1::new(pins, dma, lcd_cam, rmt)?,
             skipping: 0,
             framebuffer: Box::new([0xFF; FRAMEBUFFER_SIZE]),
-            tainted_rows: [0; TAINTED_ROWS_SIZE],
             rotation: DisplayRotation::default(),
         })
     }
@@ -138,10 +135,6 @@ impl<'a> Display<'a> {
         } else {
             self.framebuffer[index] = (value & 0xF0) | (color & 0x0F);
         }
-        // taint row
-        let tainted_index = y as usize / 8;
-        let bit = (y & 0x7) as u8;
-        self.tainted_rows[tainted_index] |= 1u8 << bit;
         Ok(())
     }
 
@@ -152,7 +145,6 @@ impl<'a> Display<'a> {
             return Err(Error::InvalidColor);
         }
         self.framebuffer.fill(color << 4 | color);
-        self.tainted_rows.fill(0xFF);
         Ok(())
     }
 
@@ -162,7 +154,6 @@ impl<'a> Display<'a> {
     pub fn flush(&mut self, mode: DrawMode) -> Result<()> {
         debug!("display flush");
         self.draw(mode)?;
-        self.tainted_rows.fill(0);
         self.framebuffer.fill(0xFF);
         Ok(())
     }
@@ -221,46 +212,39 @@ impl<'a> Display<'a> {
         self.skipping = 0;
         self.epd.frame_start()?;
 
-        for i in 0..Self::HEIGHT {
-            // before are of interest: skip
+        // Clock rows up to the bottom of the rect, then end the frame early: rows BELOW the rect are
+        // left un-driven (the gate re-homes via SPV at the next frame_start) — that's both correct
+        // (they keep their image) and fast. Rows ABOVE the rect must be inert-clocked (row_skip) to
+        // advance the gate to the rect; rows below it need not be touched at all.
+        let last = (area.y + area.height).min(Self::HEIGHT);
+        for i in 0..last {
             if i < area.y {
-                self.epd.skip()?;
-                continue;
-            }
-            if i == area.y {
+                self.row_skip()?;
+            } else if i == area.y {
                 self.epd.set_buffer(&row)?;
                 self.row_write(time)?;
-                continue;
+            } else {
+                self.row_write(time)?;
             }
-            if i >= area.y + area.height {
-                self.epd.skip()?;
-                continue;
-            }
-            self.row_write(time)?;
         }
         self.epd.frame_end()?;
 
         Ok(())
     }
 
-    // Retained for reference / the LilyGo backend's original skip-with-output behavior. Partial
-    // clear_area now skips out-of-rect rows via the inert epd.skip() (CKV-only) instead, matching
-    // flush()'s draw() path — the old zero-buffer scanline output faintly grayed non-cleared rows
-    // on the M5PaperS3 panel over repeated landscape partial updates.
-    #[allow(dead_code)]
-    fn row_skip(&mut self, output_time: u16) -> Result<()> {
-        match self.skipping {
-            0 => {
-                self.epd.set_buffer(&[0u8; BYTES_PER_LINE])?;
-                self.epd.output_row(output_time)?;
-            }
-            i if i < 2 => {
-                self.epd.output_row(10)?;
-            }
-            _ => {
-                self.epd.skip()?;
-            }
+    // Inert gate-advance row. We must DMA-stream a real line (a bare CKV-only skip with no DMA desyncs
+    // this panel's continuously-clocked gate and corrupts the image); but the streamed data is the M5
+    // panel's "no operation" 2bpp code 0b11 (=0xFF), NOT 0x00. 0x00 was found on-hardware to faintly
+    // DARKEN the clocked rows, so a partial whose gate-advance region is large — e.g. the top bar maps
+    // to the panel BOTTOM under Rotate180, advancing past nearly the whole panel every second — drifts
+    // the background to black within minutes. 0b11 leaves the advance rows truly untouched. The buffer
+    // is loaded once per skip run (`skipping` resets to 0 on every driven row); output_row(1): the data
+    // is inert so no CKV dwell beyond the DMA is needed, keeping the inert clock cheap.
+    fn row_skip(&mut self) -> Result<()> {
+        if self.skipping == 0 {
+            self.epd.set_buffer(&[0xFFu8; BYTES_PER_LINE])?;
         }
+        self.epd.output_row(1)?;
         self.skipping += 1;
 
         Ok(())
@@ -273,12 +257,6 @@ impl<'a> Display<'a> {
         Ok(())
     }
 
-    fn is_tainted(&self, row: u16) -> bool {
-        let index = row as usize / 8;
-        let bit = (row & 0x7) as u8;
-        self.tainted_rows[index] & (1u8 << bit) != 0
-    }
-
     const DRAW_IMAGE_FRAME_COUNT: usize = 15;
     fn draw(&mut self, mode: DrawMode) -> Result<()> {
         // let start = esp_hal::time::current_time();
@@ -286,21 +264,21 @@ impl<'a> Display<'a> {
         // init lut
         let mut lut = vec![mode.lut_default(); 1 << 16];
 
+        // Reference invariant (M5GFX / epdiy LCD): drive EVERY physical row every subframe with its
+        // real LUT-resolved line — never skip/advance rows. Under static-high OE every clocked row
+        // DRIVES, and charge balance only holds if each row carries balanced waveform content; an
+        // inert constant "skip" line injects net DC that integrates into the column-axis drift + the
+        // threshold "boom". Untainted rows are white in the framebuffer and resolve to a balanced
+        // no-op within the waveform, so they cost time but don't change visually or accumulate charge.
         for k in 0..Self::DRAW_IMAGE_FRAME_COUNT {
             // update lut
             update_lut(&mut lut, k, mode);
             // start draw
-            self.skipping = 0;
             self.epd.frame_start()?;
-            // build line
+            // build line — every row, real content
             for y in 0..Self::HEIGHT {
-                if !self.is_tainted(y) {
-                    self.epd.skip()?;
-                    continue;
-                }
                 let start = y as usize * LINE_BYTES_4BPP;
                 let end = start + LINE_BYTES_4BPP;
-                // draw
                 let mut dma_line = [0u8; BYTES_PER_LINE];
                 prepare_dma_buffer(&self.framebuffer[start..end], &lut, &mut dma_line);
                 self.epd.set_buffer(&dma_line)?;

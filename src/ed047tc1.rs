@@ -214,6 +214,11 @@ impl<'d> M5PaperS3Control<'d> {
         self.pin_le.set_high();
     }
 
+    // Bare CKV-only skip (no DMA). INTENTIONALLY UNUSED on the M5PaperS3: with OE static-high a bare
+    // skip drives the stale source latch onto the skipped row and desyncs the gate over long runs
+    // (grayscale corruption in landscape). The render paths now clock every row with a real DMA line
+    // instead. Kept for reference / the LilyGo (RMT) backend's skip path.
+    #[allow(dead_code)]
     fn skip_line(&mut self) {
         // Similar to the original LilyGo `skip()` CKV pulse, but using GPIO.
         self.pin_le.set_low();
@@ -488,6 +493,10 @@ impl<'a> ED047TC1<'a> {
         }
     }
 
+    // INTENTIONALLY UNUSED — see `skip_line`: a bare CKV-only advance is unsafe on the M5PaperS3 (drives
+    // stale latch data / desyncs the gate), so the render paths clock every row with a real DMA line.
+    // Retained for the LilyGo RMT backend and reference.
+    #[allow(dead_code)]
     pub(crate) fn skip(&mut self) -> crate::Result<()> {
         match &mut self.backend {
             Backend::LilyGo { rmt, .. } => {
