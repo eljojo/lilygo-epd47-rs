@@ -135,6 +135,26 @@ What this fork adds on top of that base:
   drives *every* physical row with its real charge-balanced waveform instead of bare CKV skips —
   this fixes the DC build-up that grayed/corrupted the panel over repeated landscape partials. The
   unused mode-1/mode-2 LUT tables (~8k lines) were dropped.
+- **FastEPD-derived fast paths + perf (M5PaperS3)** — backported from
+  [FastEPD (bitbank2)](https://github.com/bitbank2/FastEPD), which drives this exact panel:
+  - **2-bpp (4-gray) flicker-free updates.** A persistent `current`/`previous` 2-bpp framebuffer
+    (lazily allocated) with `flush_gray2()` (full: 5 black/white + 1 gray pass) and `partial_gray2()`
+    (FastEPD's `bbep2BppPartial` diff — pushes only the changed pixels via a 16-entry old×new
+    transition LUT, no `clear_rect` flash), plus `set_pixel_gray2`/`fill_gray2` and a `Gray2`-colour
+    `gray2()` embedded-graphics target. `sync_gray2_from_framebuffer()` re-anchors the 2-bpp buffer
+    from the 16-gray framebuffer so a fast 4-gray partial leaves a 16-gray image beneath it untouched.
+  - **8-pass matrix grayscale** (`flush_matrix()`, FastEPD's `u8M5Matrix`) — present but **not the
+    default**: on this panel it ghosts on large/orientation changes (it is a from-white painter with
+    no previous-state ghost cancellation, and relies entirely on a strong flash-clear). `flush_waveform`
+    (the epdiy GC16) remains the recommended full-repaint path; the matrix is kept for a future retry
+    paired with a stronger clear.
+  - **Async DMA pipeline** — `output_frame()` double-buffers scanlines and overlaps pixel-prep with the
+    in-flight DMA (FastEPD's `iDMAOff` ping-pong), and the M5 parallel bus runs at **20 MHz** (FastEPD's
+    M5 speed) instead of 16.
+  - **Panel quirk vs FastEPD.** FastEPD's no-field / neutral code is `0b00`; on *this* M5PaperS3 wiring
+    `0b00` faintly **darkens** clocked rows (a slow background "boom" under sustained partials), so the
+    inert / no-op / skip code here is `0b11` (`0xFF`) and there is no `0b00` discharge frame. Everything
+    else (drive-every-row, 2-bpp diff, matrix) matches FastEPD.
 
 ## Todos
 
@@ -150,6 +170,8 @@ This project is largely based on the C implementations provided by:
 - [Official LilyGo Driver](https://github.com/Xinyuan-LilyGO/LilyGo-EPD47)
 - [epdiy](https://github.com/vroland/epdiy)
 - [M5GFX](https://github.com/m5stack/M5GFX) — reference for the M5PaperS3 EPD bus control
+- [FastEPD (bitbank2)](https://github.com/bitbank2/FastEPD) — source of the 2-bpp diff, the 8-pass
+  grayscale matrix, the async-DMA pipeline, and the 20 MHz M5 bus speed
 
 Rust upstream / forks:
 

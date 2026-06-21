@@ -38,6 +38,11 @@ const PAPER_S3_LINE_BYTES: usize = LINE_BYTES + PAPER_S3_LINE_PADDING;
 /// The DMA buffer must fit the largest scanline of any supported board.
 const DMA_BUFFER_SIZE: usize = PAPER_S3_LINE_BYTES;
 
+/// M5PaperS3 parallel-bus pixel clock. FastEPD (bitbank2) drives this panel at 20 MHz
+/// (its M5 `panelDef.bus_speed`); we match that. NOTE: faster DMA shortens the per-line time, so the
+/// calibrated waveform path compensates with a larger `WF_DWELL` to hold ~15.5 µs/line (see display.rs).
+const PAPER_S3_BUS_MHZ: u32 = 20;
+
 struct ConfigRegister {
     latch_enable: bool,
     power_disable: bool,
@@ -300,6 +305,10 @@ pub(crate) struct ED047TC1<'a> {
     i8080: Option<i8080::I8080<'a, Blocking>>,
     backend: Backend<'a>,
     dma_buf: Option<DmaTxBuf>,
+    /// Second scanline buffer for the ping-pong pipeline in [`output_frame`]. While one buffer is
+    /// in-flight on the DMA, the CPU fills the other — overlapping pixel-prep with the transfer the way
+    /// FastEPD (bitbank2) does on the ESP32-S3 (it ping-pongs `dma_buf` via `iDMAOff ^= width/4`).
+    dma_buf_b: Option<DmaTxBuf>,
     line_bytes: usize,
 }
 
@@ -328,6 +337,9 @@ impl<'a> ED047TC1<'a> {
         let (_, _, tx_buffer, tx_descriptors) = dma_buffers!(0, DMA_BUFFER_SIZE);
         let dma_buf =
             Some(DmaTxBuf::new(tx_descriptors, tx_buffer).map_err(crate::Error::DmaBuffer)?);
+        let (_, _, tx_buffer_b, tx_descriptors_b) = dma_buffers!(0, DMA_BUFFER_SIZE);
+        let dma_buf_b =
+            Some(DmaTxBuf::new(tx_descriptors_b, tx_buffer_b).map_err(crate::Error::DmaBuffer)?);
 
         let (i8080, backend, line_bytes) = match pins {
             PinConfig::LilyGoT5V23(pins) => {
@@ -382,7 +394,8 @@ impl<'a> ED047TC1<'a> {
                 // Match M5GFX `Bus_EPD`:
                 // - SPH is wired to LCD_CS, not LCD_DC.
                 // - There is no meaningful DC line on this bus.
-                let config = i8080::Config::default().with_frequency(Rate::from_mhz(16));
+                let config =
+                    i8080::Config::default().with_frequency(Rate::from_mhz(PAPER_S3_BUS_MHZ));
 
                 let i8080 = i8080::I8080::new(lcd_cam.lcd, dma, config)
                     .map_err(crate::Error::I8080Config)?
@@ -410,6 +423,7 @@ impl<'a> ED047TC1<'a> {
             i8080: Some(i8080),
             backend,
             dma_buf,
+            dma_buf_b,
             line_bytes,
         })
     }
@@ -602,6 +616,127 @@ impl<'a> ED047TC1<'a> {
         }
         dma_buf.set_length(self.line_bytes);
         self.dma_buf = Some(dma_buf);
+        Ok(())
+    }
+
+    /// Drive a full frame of `height` rows, calling `fill(y, line)` to produce each row's logical
+    /// (pre-swizzle) `LINE_BYTES` scanline. Caller wraps this in `frame_start`/`frame_end`.
+    ///
+    /// On the M5PaperS3 this pipelines like FastEPD (bitbank2): while row N's scanline DMAs out, the CPU
+    /// computes row N+1 into the other buffer, so per-line wall time becomes `max(dma, prep)` instead of
+    /// `dma + prep`. The CKV/LE sequence per row is unchanged from [`output_row`] — only the pixel-prep
+    /// is moved into the CKV-high window of the previous row. The LilyGo backend keeps the serial path.
+    pub(crate) fn output_frame<F>(
+        &mut self,
+        height: u16,
+        output_time: u16,
+        mut fill: F,
+    ) -> crate::Result<()>
+    where
+        F: FnMut(u16, &mut [u8; LINE_BYTES]),
+    {
+        if matches!(self.backend, Backend::M5PaperS3 { .. }) {
+            return self.output_frame_m5(height, output_time, fill);
+        }
+        // LilyGo (RMT) backend: plain serial loop reusing the existing per-row primitives.
+        let mut scratch = [0u8; LINE_BYTES];
+        for y in 0..height {
+            fill(y, &mut scratch);
+            self.set_buffer(&scratch)?;
+            self.output_row(output_time)?;
+        }
+        Ok(())
+    }
+
+    fn output_frame_m5<F>(
+        &mut self,
+        height: u16,
+        output_time: u16,
+        mut fill: F,
+    ) -> crate::Result<()>
+    where
+        F: FnMut(u16, &mut [u8; LINE_BYTES]),
+    {
+        let ED047TC1 {
+            i8080,
+            backend,
+            dma_buf,
+            dma_buf_b,
+            line_bytes,
+        } = self;
+        let ctrl = match backend {
+            Backend::M5PaperS3 { ctrl } => ctrl,
+            Backend::LilyGo { .. } => return Err(crate::Error::Unknown),
+        };
+        let line_bytes = *line_bytes;
+        if height == 0 {
+            return Ok(());
+        }
+
+        // Swizzle a logical scanline into a DMA buffer (M5GFX 2bpp pixel order, matches `set_buffer`).
+        let load = |buf: &mut DmaTxBuf, scratch: &[u8; LINE_BYTES]| {
+            let slice = buf.as_mut_slice();
+            slice.fill(0);
+            for (dst, &src) in slice[..LINE_BYTES].iter_mut().zip(scratch.iter()) {
+                *dst = swizzle_papers3_byte(src);
+            }
+            buf.set_length(line_bytes);
+        };
+
+        let mut scratch = [0u8; LINE_BYTES];
+        let mut in_flight = dma_buf.take().ok_or(crate::Error::Unknown)?;
+        let mut free = dma_buf_b.take().ok_or(crate::Error::Unknown)?;
+        let i80 = i8080.take().ok_or(crate::Error::Unknown)?;
+
+        // Prime row 0 and launch its DMA (CKV already high from frame_start / scanline_begin).
+        fill(0, &mut scratch);
+        load(&mut in_flight, &scratch);
+        let mut start_cycles = ctrl.scanline_begin();
+        // `match` (not `map_err`) so `free`/`done` are only consumed on the error arm — a move-closure
+        // would capture them even on the success path and they're needed for the next row.
+        let mut transfer = match i80.send(Command::<u8>::None, 0, in_flight) {
+            Ok(t) => t,
+            Err((err, i80, buf)) => {
+                *i8080 = Some(i80);
+                *dma_buf = Some(buf);
+                *dma_buf_b = Some(free);
+                return Err(crate::Error::Dma(err));
+            }
+        };
+
+        for y in 1..height {
+            // Overlap: compute row y into the free buffer while row y-1 is still DMAing.
+            fill(y, &mut scratch);
+            load(&mut free, &scratch);
+
+            let (r, i80, done) = transfer.wait();
+            if let Err(err) = r {
+                *i8080 = Some(i80);
+                *dma_buf = Some(done);
+                *dma_buf_b = Some(free);
+                return Err(crate::Error::Dma(err));
+            }
+            ctrl.scanline_end(output_time, start_cycles);
+
+            start_cycles = ctrl.scanline_begin();
+            transfer = match i80.send(Command::<u8>::None, 0, free) {
+                Ok(t) => t,
+                Err((err, i80, buf)) => {
+                    *i8080 = Some(i80);
+                    *dma_buf = Some(buf);
+                    *dma_buf_b = Some(done);
+                    return Err(crate::Error::Dma(err));
+                }
+            };
+            free = done;
+        }
+
+        let (r, i80, done) = transfer.wait();
+        ctrl.scanline_end(output_time, start_cycles);
+        *i8080 = Some(i80);
+        *dma_buf = Some(done);
+        *dma_buf_b = Some(free);
+        r.map_err(crate::Error::Dma)?;
         Ok(())
     }
 }
